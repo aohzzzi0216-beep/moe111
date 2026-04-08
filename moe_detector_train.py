@@ -12,7 +12,7 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 import numpy as np
 import random
 import datetime
-
+import re  # 记得在文件头部导入 re
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 # 全局参数
@@ -121,11 +121,17 @@ class SeqXGPTDataset(Dataset):
         prompt_len = item["prompt_len"]
         orig_line_idx = item["orig_line_idx"]
 
-        # 🌟 修复 2：抛弃词级对齐，改用绝对字符边界对齐
-        words = text.split()
-        # 还原 prompt 部分的原始文本，并计算其准确的字符长度
-        prompt_text = " ".join(words[:prompt_len])
-        prompt_char_boundary = len(prompt_text)
+        # 🌟 修复 1：使用正则表达式精准定位原始字符边界 (保留所有原始空白符)
+        # \S+ 匹配任何非空白字符序列（即原始单词），finditer 会返回它们在原字符串中的确切起止位置
+        word_matches = list(re.finditer(r'\S+', text))
+
+        if prompt_len <= 0:
+            prompt_char_boundary = 0
+        elif prompt_len <= len(word_matches):
+            # 取第 prompt_len 个单词在原始字符串中的真实结束索引
+            prompt_char_boundary = word_matches[prompt_len - 1].end()
+        else:
+            prompt_char_boundary = len(text)
 
         encoding = self.tokenizer(
             text,
@@ -138,63 +144,96 @@ class SeqXGPTDataset(Dataset):
 
         offsets = encoding["offset_mapping"].squeeze(0)  # [seq_len, 2]
 
+        # 🌟 修复 2：跨边界 token 的占比判别机制
         token_labels = []
         for start_char, end_char in offsets:
             if start_char == end_char:
+                # 特殊 Token ([CLS], [SEP], [PAD])
                 token_labels.append(-100)
             elif end_char <= prompt_char_boundary:
+                # 纯人类文本区域
                 token_labels.append(0)
             elif start_char >= prompt_char_boundary:
+                # 纯 AI 生成区域
                 token_labels.append(1)
             else:
-                token_labels.append(1)
+                # 跨边界 Token：计算该 Token 落入两侧的字符长度
+                len_in_human = prompt_char_boundary - start_char
+                len_in_ai = end_char - prompt_char_boundary
 
-        seq_len = min(len(words), self.max_length)
+                # 策略：谁占比大，就归属哪一类 (也可以为了保险起见，直接设置为 -100 忽略该 Token)
+                if len_in_human >= len_in_ai:
+                    token_labels.append(0)
+                else:
+                    token_labels.append(1)
 
-        # ========== 修复后的三元组提取逻辑 ==========
+        seq_len = encoding["attention_mask"].sum().item()
+
+        # ========== 优化后的对比学习数据提取逻辑 ==========
         human_text = text[:prompt_char_boundary].strip()
         ai_text = text[prompt_char_boundary:].strip()
 
-        # 安全截取逻辑
-        text_anc = human_text[-min(len(human_text), 800):]
-        text_pos = ai_text[:min(len(ai_text), 800)]
+        # 1. 纯人类文本 (Anchor/Positive 候选)
+        t_human = human_text[-min(len(human_text), 800):] if human_text else " "
+
+        # 2. 纯AI文本 (Easy Negative)
+        t_ai = ai_text[:min(len(ai_text), 800)] if ai_text else " "
+
+        # 3. 边界拼接文本 (Hard Negative)
         h_tail = human_text[-min(len(human_text), 400):]
         a_head = ai_text[:min(len(ai_text), 400)]
-        text_neg = h_tail + " " + a_head
-
-        # 空格兜底
-        t_anc = text_anc if text_anc else " "
-        t_pos = text_pos if text_pos else " "
-        t_neg = text_neg if text_neg else " "
+        t_mix = h_tail + " " + a_head if (h_tail or a_head) else " "
 
         # 统一 Tokenize
-        enc_anc = self.tokenizer(t_anc, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
-        enc_pos = self.tokenizer(t_pos, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
-        enc_neg = self.tokenizer(t_neg, max_length=128, padding="max_length", truncation=True, return_tensors="pt")
+        enc_human = self.tokenizer(t_human, max_length=64, padding="max_length", truncation=True, return_tensors="pt")
+        enc_ai = self.tokenizer(t_ai, max_length=64, padding="max_length", truncation=True, return_tensors="pt")
+        enc_mix = self.tokenizer(t_mix, max_length=64, padding="max_length", truncation=True, return_tensors="pt")
 
         result = {
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
             "labels": torch.tensor(token_labels, dtype=torch.long),
             "seq_length": torch.tensor(seq_len, dtype=torch.long),
-            "anc_ids": enc_anc["input_ids"].squeeze(0),
-            "anc_mask": enc_anc["attention_mask"].squeeze(0),
-            "pos_ids": enc_pos["input_ids"].squeeze(0),
-            "pos_mask": enc_pos["attention_mask"].squeeze(0),
-            "neg_ids": enc_neg["input_ids"].squeeze(0),
-            "neg_mask": enc_neg["attention_mask"].squeeze(0)
+
+            # 替换原来的 anc/pos/neg，语义更明确
+            "human_ids": enc_human["input_ids"].squeeze(0),
+            "human_mask": enc_human["attention_mask"].squeeze(0),
+            "ai_ids": enc_ai["input_ids"].squeeze(0),
+            "ai_mask": enc_ai["attention_mask"].squeeze(0),
+            "mix_ids": enc_mix["input_ids"].squeeze(0),
+            "mix_mask": enc_mix["attention_mask"].squeeze(0)
         }
 
-        # 邻接矩阵加载逻辑
+        # ========== 修复后的邻接矩阵加载与容错逻辑 ==========
+        # 1. 准备基础矩阵
         if self.adj_matrices is not None:
             try:
                 adj_sparse = self.adj_matrices[orig_line_idx]
-                result['adj_matrix'] = adj_sparse.to_dense().to(torch.float32)
+                adj_dense = adj_sparse.to_dense().to(torch.float32)
             except IndexError:
-                print(f"⚠️ Warning: 找不到行号 {orig_line_idx} 对应的矩阵，已使用单位矩阵代替。")
-                result['adj_matrix'] = torch.eye(self.max_length, dtype=torch.float32)
+                print(f"⚠️ Warning: 找不到行号 {orig_line_idx} 对应的矩阵，已降级为局部序列关联图。")
+                # 降级方案：创建一个三对角矩阵（局部序列关联图）
+                adj_dense = torch.eye(self.max_length, dtype=torch.float32)
+                idx = torch.arange(self.max_length - 1)
+                adj_dense[idx, idx + 1] = 1.0  # 向后连接
+                adj_dense[idx + 1, idx] = 1.0  # 向前连接
         else:
-            result['adj_matrix'] = torch.eye(self.max_length, dtype=torch.float32)
+            # 没有提供矩阵文件时的默认降级方案
+            adj_dense = torch.eye(self.max_length, dtype=torch.float32)
+            idx = torch.arange(self.max_length - 1)
+            adj_dense[idx, idx + 1] = 1.0
+            adj_dense[idx + 1, idx] = 1.0
+
+        # 2. 🌟 强制 2D 掩码阻断 (屏蔽 Padding 噪声)
+        # 获取 1D 的 attention_mask (1 为有效，0 为 padding)
+        attn_mask_1d = encoding["attention_mask"].squeeze(0).float()
+
+        # 将 1D Mask 转换为 2D 矩阵掩码：只有当行和列对应的 token 都是真实的，才保留边
+        # [max_length] -> [max_length, max_length]
+        attn_mask_2d = attn_mask_1d.unsqueeze(1) * attn_mask_1d.unsqueeze(0)
+
+        # 应用掩码，彻底清除 padding 节点的所有边
+        result['adj_matrix'] = adj_dense * attn_mask_2d
 
         return result
 
@@ -202,7 +241,7 @@ class SeqXGPTDataset(Dataset):
 # 3. 细粒度 Token 级分簇 MoE 检测器
 ## ==========================================
 class MoEDetector(nn.Module):
-    def __init__(self, backbone_name="microsoft/deberta-v2-xlarge", num_sem_experts=3, num_syn_experts=3):
+    def __init__(self, backbone_name="microsoft/deberta-v3-base", num_sem_experts=3, num_syn_experts=3):
         super().__init__()
         self.backbones = AutoModel.from_pretrained(backbone_name)
         hidden_size = self.backbones.config.hidden_size
@@ -232,6 +271,7 @@ class MoEDetector(nn.Module):
 
         # 最终分类器
         self.classifier = nn.Linear(hidden_size, 2)
+
 
     def get_semantic_embedding(self, input_ids, attention_mask):
         """专用于对比学习：独立提取片段的语义专家联合表征"""
@@ -307,41 +347,48 @@ class MoEDetector(nn.Module):
         # 初始化 Loss
         loss = None
 
-        # 只有在传入标签时（训练/验证阶段）计算 Loss
         if labels is not None:
-            # 1. 计算主分类任务的交叉熵损失
+            # 1. 主干交叉熵损失 & 2. 负载均衡损失 (保持不变)
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            # 展平进行计算，忽略 Padding 的部分
             active_logits = logits.view(-1, 2)
             active_labels = labels.view(-1)
             cls_loss = loss_fct(active_logits, active_labels)
 
-            # 2. 计算标准负载均衡损失 (防止专家坍缩)
             def calc_balance_loss(probs):
-                # probs: [batch, seq_len, num_experts]
-                mean_probs = probs.mean(dim=(0, 1))  # 求得每个专家的平均被选中概率
+                mean_probs = probs.mean(dim=(0, 1))
                 num_experts = mean_probs.size(0)
-                # 均方惩罚：当所有专家概率均为 1/num_experts 时取得极小值，强制负载均衡
                 return num_experts * torch.sum(mean_probs * mean_probs)
 
             balance_loss = calc_balance_loss(router_probs[:, :, 0:3]) + \
                            calc_balance_loss(router_probs[:, :, 5:8])
 
-            # 合并基础损失
             loss = cls_loss + 0.01 * balance_loss
 
-            # 3. ============ 核心模块：引入语义专家的对比学习损失 ============
-            # 只有在训练阶段（传入了三元组数据）才累加对比损失
-            if all(v is not None for v in [anc_ids, pos_ids, neg_ids]):
-                # 🌟 增加校验：确保当前 Batch 的 Mask 有效，防止对纯 Padding 计算导致 NaN
-                if anc_mask.sum() > 0 and pos_mask.sum() > 0 and neg_mask.sum() > 0:
-                    emb_anc = self.get_semantic_embedding(anc_ids, anc_mask)
-                    emb_pos = self.get_semantic_embedding(pos_ids, pos_mask)
-                    emb_neg = self.get_semantic_embedding(neg_ids, neg_mask)
+            # 3. ============ 优化后的 In-Batch 语义对比学习 ============
+            if all(v is not None for v in [human_ids, ai_ids, mix_ids]):
+                if human_mask.sum() > 0 and ai_mask.sum() > 0 and mix_mask.sum() > 0:
+                    # 提取特征 [Batch, Hidden_Dim]
+                    emb_human = self.get_semantic_embedding(human_ids, human_mask)
+                    emb_ai = self.get_semantic_embedding(ai_ids, ai_mask)
+                    emb_mix = self.get_semantic_embedding(mix_ids, mix_mask)
 
-                    # Margin 设置为 1.0，使用欧式距离 (p=2)
-                    triplet_loss_fn = nn.TripletMarginLoss(margin=1.0, p=2)
-                    contrastive_loss = triplet_loss_fn(emb_anc, emb_pos, emb_neg)
+                    # 🌟 核心技巧：In-Batch Positives (你的思路落地)
+                    # 将 human 特征在 batch 维度错位移动 1 格。
+                    # 这样 sample 0 的正样本就是 sample 1 的人类文本，依次类推
+                    emb_human_pos = torch.roll(emb_human, shifts=1, dims=0)
+
+                    # Margin 设置为 1.0
+                    triplet_loss_fn = nn.TripletMarginLoss(margin=1.5, p=2)
+
+                    # 距离公式： d(Anchor, Positive) - d(Anchor, Negative) + margin
+                    # ① 难负样本对比 (Hard Contrastive): 强制区分 其他人类文本 vs 拼接边界
+                    loss_hard = triplet_loss_fn(emb_human, emb_human_pos, emb_mix)
+
+                    # ② 简单负样本对比 (Easy Contrastive): 强制区分 其他人类文本 vs 纯AI文本
+                    loss_easy = triplet_loss_fn(emb_human, emb_human_pos, emb_ai)
+
+                    # 综合对比损失 (Hard 权重大，Easy 权重小)
+                    contrastive_loss = loss_hard + 0.5 * loss_easy
 
                     # 以 0.1 的权重汇入总 Loss
                     loss = loss + 0.1 * contrastive_loss
@@ -387,9 +434,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🖥️ 当前使用的计算设备: {device}")
 
-    print("正在加载 deberta-v2-xlarge 和 模型...")
-    # DeBERTa-V2 分词器直接加载即可
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v2-xlarge", use_fast=True)
+    print("正在加载 deberta-v3-base 和 模型...")
+    # DeBERTa-V3 分词器直接加载即可
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-base", use_fast=True)
 
     print("正在加载已物理切分的训练、验证、测试集及 GCN 邻接矩阵...")
 
@@ -402,14 +449,14 @@ if __name__ == "__main__":
     g = torch.Generator()
     g.manual_seed(42)
 
-    #显存保护：恢复 batch_size = 2
-    train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, worker_init_fn=seed_worker, generator=g)
-    val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False)
+    #显存保护：恢复 batch_size = 8
+    train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True, worker_init_fn=seed_worker, generator=g)
+    val_dataloader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=8, shuffle=False)
 
     print(f"✅ 数据加载完成：训练集 {len(train_dataset)} | 验证集 {len(val_dataset)} | 测试集 {len(test_dataset)}")
 
-    model = MoEDetector(backbone_name="microsoft/deberta-v2-xlarge", num_sem_experts=3, num_syn_experts=3)
+    model = MoEDetector(backbone_name="microsoft/deberta-v3-base", num_sem_experts=3, num_syn_experts=3)
     model.backbones.resize_token_embeddings(len(tokenizer))
     model.to(device)
 
@@ -458,7 +505,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
     # 正确方式：先计算每轮 Epoch 实际触发多少次 optimizer.step()
     epochs = 20
-    accumulation_steps = 16
+    accumulation_steps = 4
 
     # 使用向上取整除法，确保最后不满 accumulation_steps 的那一个 batch 也能被计入更新步数
     steps_per_epoch = (len(train_dataloader) + accumulation_steps - 1) // accumulation_steps
@@ -486,17 +533,17 @@ if __name__ == "__main__":
             labels = batch['labels'].to(device)
             adj_matrix = batch['adj_matrix'].to(device)
 
-            # --- 提取对比学习三元组并送入 device ---
-            anc_ids = batch.get('anc_ids').to(device) if 'anc_ids' in batch else None
-            anc_mask = batch.get('anc_mask').to(device) if 'anc_mask' in batch else None
-            pos_ids = batch.get('pos_ids').to(device) if 'pos_ids' in batch else None
-            pos_mask = batch.get('pos_mask').to(device) if 'pos_mask' in batch else None
-            neg_ids = batch.get('neg_ids').to(device) if 'neg_ids' in batch else None
-            neg_mask = batch.get('neg_mask').to(device) if 'neg_mask' in batch else None
+            # --- 提取对比学习数据并送入 device ---
+            human_ids = batch.get('human_ids').to(device) if 'human_ids' in batch else None
+            human_mask = batch.get('human_mask').to(device) if 'human_mask' in batch else None
+            ai_ids = batch.get('ai_ids').to(device) if 'ai_ids' in batch else None
+            ai_mask = batch.get('ai_mask').to(device) if 'ai_mask' in batch else None
+            mix_ids = batch.get('mix_ids').to(device) if 'mix_ids' in batch else None
+            mix_mask = batch.get('mix_mask').to(device) if 'mix_mask' in batch else None
 
             # 送入模型
             loss, _ = model(input_ids, attention_mask, seq_lengths, adj_matrix, labels,
-                            anc_ids, anc_mask, pos_ids, pos_mask, neg_ids, neg_mask)
+                            human_ids, human_mask, ai_ids, ai_mask, mix_ids, mix_mask)
 
             loss = loss / accumulation_steps
             loss.backward()
@@ -549,5 +596,5 @@ if __name__ == "__main__":
         f.write(f"  - Recall:    {test_r * 100:.2f}%\n")
         f.write(f"  - Macro-F1:  {test_macro_f1 * 100:.2f}%\n")
         f.write(
-            f"  - 核心参数: max_len={GLOBAL_MAX_LEN}, epochs={epochs}, effective_batch_size=32 (8x4), backbone=microsoft/deberta-v2-xlarge\n")
+            f"  - 核心参数: max_len={GLOBAL_MAX_LEN}, epochs={epochs}, effective_batch_size=32 (8x4), backbone=microsoft/deberta-v3-base\n")
         f.write("-" * 50 + "\n")
