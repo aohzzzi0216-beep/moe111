@@ -1,3 +1,6 @@
+# ==========================================
+# 文件名: prepare_gcn_adj.py (Large 版本)
+# ==========================================
 import os
 import json
 import torch
@@ -8,8 +11,8 @@ from tqdm import tqdm
 # ==========================================
 # 全局配置
 # ==========================================
-# 确保与训练脚本一致，DeBERTa-v2 必须使用 fast tokenizer 以获取 offsets
-MODEL_NAME = "microsoft/deberta-v2-xlarge"
+#  修改：与主干网络对齐，使用 large 版本的分词器
+MODEL_NAME = "microsoft/deberta-v3-large"
 GLOBAL_MAX_LEN = 512
 
 # 加载 spacy 英文模型 (请确保已安装: python -m spacy download en_core_web_sm)
@@ -24,7 +27,7 @@ except:
 
 def generate_adj_matrices(jsonl_path, output_pt_path):
     """
-    针对 DeBERTa-v2 优化的句法邻接矩阵生成脚本
+    针对 DeBERTa-v3 优化的句法邻接矩阵生成脚本
     修复：区间重叠对齐、O(E) 边表加速、稀疏化存储
     """
     # 显式开启 use_fast=True 否则无法获取 offset_mapping
