@@ -339,27 +339,38 @@ class MoEDetector(nn.Module):
         # 所有 Token 先统一通过共享 GCN 底座，提取出深层句法特征 H_syn
         shared_syntax_features = self.shared_syntax_base(hidden_states, adj_matrix)
 
-        # -- 聚合句法专家 --
+        # =====================================================================
+        # 🚀 优化：真正的物理稀疏计算 (先抽离 Token，再送入专家，最后拼装)
+        # =====================================================================
+
+        # -- 1. 聚合句法专家 (稀疏化) --
         for i, expert in enumerate(self.syn_experts):
-            # 每个专家接受统一的句法表征，进行内部的细分功能推断
-            expert_out = expert(shared_syntax_features)
             mask = (syn_idx == i)  # [batch, seq_len]
-            fused_features[mask] += expert_out[mask] * top3_probs[..., 0][mask].unsqueeze(-1)
+            if mask.any():  # 只有当该专家被选中时，才触发计算
+                # 仅将选中的 Token 特征送入专家
+                expert_out = expert(shared_syntax_features[mask])
+                # 乘以归一化权重并累加回原位置
+                fused_features[mask] += expert_out * top3_probs[..., 0][mask].unsqueeze(-1)
 
-        # -- 聚合长度专家 --
-        short_out = self.len_expert_short(hidden_states)
+        # -- 2. 聚合长度专家 (稀疏化) --
         mask_short = (len_idx == 3)
-        fused_features[mask_short] += short_out[mask_short] * top3_probs[..., 1][mask_short].unsqueeze(-1)
+        if mask_short.any():
+            short_out = self.len_expert_short(hidden_states[mask_short])
+            fused_features[mask_short] += short_out * top3_probs[..., 1][mask_short].unsqueeze(-1)
 
-        long_out = self.len_expert_long(hidden_states)
         mask_long = (len_idx == 4)
-        fused_features[mask_long] += long_out[mask_long] * top3_probs[..., 1][mask_long].unsqueeze(-1)
+        if mask_long.any():
+            long_out = self.len_expert_long(hidden_states[mask_long])
+            fused_features[mask_long] += long_out * top3_probs[..., 1][mask_long].unsqueeze(-1)
 
-        # -- 聚合语义专家 --
+        # -- 3. 聚合语义专家 (稀疏化) --
         for i, expert in enumerate(self.sem_experts):
-            expert_out = expert(hidden_states)
             mask = (sem_idx == i + 5)
-            fused_features[mask] += expert_out[mask] * top3_probs[..., 2][mask].unsqueeze(-1)
+            if mask.any():
+                expert_out = expert(hidden_states[mask])
+                fused_features[mask] += expert_out * top3_probs[..., 2][mask].unsqueeze(-1)
+
+        # =====================================================================
 
         # 细粒度逐词分类
         logits = self.classifier(fused_features)  # [batch, seq_len, 2]
